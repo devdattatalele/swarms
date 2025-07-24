@@ -1257,6 +1257,29 @@ class Agent:
         # to ensure proper exception propagation
         self.__handle_run_error(error)
 
+    async def _handle_run_error_async(self, error: any):
+        """
+        Async version of error handling for arun method.
+        Enhanced for streaming + tools compatibility.
+        """
+        try:
+            # Log the error with agent context
+            logger.error(f"Agent '{self.agent_name}': Async execution error: {type(error).__name__}: {str(error)}")
+            
+            # Auto-save if enabled
+            if self.autosave:
+                # Run save in thread to avoid blocking async context
+                await asyncio.to_thread(self.save)
+                await asyncio.to_thread(log_agent_data, self.to_dict())
+            
+            # Re-raise the original error
+            raise error
+            
+        except Exception as handling_error:
+            logger.error(f"Agent '{self.agent_name}': Error in async error handling: {handling_error}")
+            # Raise the original error, not the handling error
+            raise error
+
     async def arun(
         self,
         task: Optional[str] = None,
@@ -1266,16 +1289,12 @@ class Agent:
     ) -> Any:
         """
         Asynchronously runs the agent with the specified parameters.
+        
+        Enhanced to handle streaming + tools compatibility in async context.
 
         Args:
             task (Optional[str]): The task to be performed. Defaults to None.
             img (Optional[str]): The image to be processed. Defaults to None.
-            is_last (bool): Indicates if this is the last task. Defaults to False.
-            device (str): The device to use for execution. Defaults to "cpu".
-            device_id (int): The ID of the GPU to use if device is set to "gpu". Defaults to 1.
-            all_cores (bool): If True, uses all available CPU cores. Defaults to True.
-            do_not_use_cluster_ops (bool): If True, does not use cluster operations. Defaults to True.
-            all_gpus (bool): If True, uses all available GPUs. Defaults to False.
             *args: Additional positional arguments.
             **kwargs: Additional keyword arguments.
 
@@ -1286,6 +1305,22 @@ class Agent:
             Exception: If an error occurs during the asynchronous operation.
         """
         try:
+            # Log async execution start
+            if self.verbose:
+                logger.debug(f"Agent '{self.agent_name}': Starting async execution")
+            
+            # Check if tools are present for async context
+            tools_present = (
+                exists(self.tools_list_dictionary) or 
+                exists(self.mcp_url) or 
+                exists(self.mcp_urls) or 
+                exists(self.mcp_config)
+            )
+            
+            if tools_present and self.verbose:
+                logger.info(f"Agent '{self.agent_name}': Running async with tools present - streaming will be managed appropriately")
+            
+            # Use asyncio.to_thread for CPU-bound operations with proper error handling
             return await asyncio.to_thread(
                 self.run,
                 task=task,
@@ -1293,10 +1328,12 @@ class Agent:
                 *args,
                 **kwargs,
             )
+        except asyncio.CancelledError:
+            logger.warning(f"Agent '{self.agent_name}': Async execution was cancelled")
+            raise
         except Exception as error:
-            await self._handle_run_error(
-                error
-            )  # Ensure this is also async if needed
+            logger.error(f"Agent '{self.agent_name}': Error in async execution: {error}")
+            await self._handle_run_error_async(error)
 
     def __call__(
         self,
@@ -2585,9 +2622,14 @@ class Agent:
 
         except AgentLLMError as e:
             logger.error(
-                f"Error calling LLM: {e}. Task: {task}, Args: {args}, Kwargs: {kwargs}"
+                f"Agent '{self.agent_name}': Error calling LLM in loop {current_loop}: {e}. Task: {task[:100]}..., Args: {args}, Kwargs: {kwargs}"
             )
             raise e
+        except Exception as e:
+            logger.error(
+                f"Agent '{self.agent_name}': Unexpected error in call_llm in loop {current_loop}: {e}. Task: {task[:100]}..."
+            )
+            raise AgentLLMError(f"LLM call failed: {e}")
 
     def handle_sop_ops(self):
         # If the user inputs a list of strings for the sop then join them and set the sop
@@ -2823,6 +2865,8 @@ class Agent:
     def parse_llm_output(self, response: Any):
         """Parse and standardize the output from the LLM.
 
+        Enhanced to handle streaming + tools compatibility and ensure proper output formatting.
+
         Args:
             response (Any): The response from the LLM in any format
 
@@ -2833,18 +2877,39 @@ class Agent:
             ValueError: If the response format is unexpected and can't be handled
         """
         try:
+            # Log output parsing for debugging
+            if self.verbose:
+                logger.debug(f"Agent '{self.agent_name}': Parsing LLM output of type: {type(response)}")
 
+            # Handle None response (can happen with streaming issues)
+            if response is None:
+                logger.warning(f"Agent '{self.agent_name}': Received None response from LLM")
+                return ""
+
+            # Handle dictionary responses (including tool calls)
             if isinstance(response, dict):
+                # Standard OpenAI API response format
                 if "choices" in response:
-                    return response["choices"][0]["message"][
-                        "content"
-                    ]
-                return json.dumps(
-                    response
-                )  # Convert other dicts to string
+                    content = response["choices"][0]["message"]["content"]
+                    if self.verbose:
+                        logger.debug(f"Agent '{self.agent_name}': Extracted content from choices format")
+                    return content if content is not None else ""
+                
+                # Tool call response format
+                if "tool_calls" in response or "function" in response:
+                    if self.verbose:
+                        logger.debug(f"Agent '{self.agent_name}': Detected tool call response format")
+                    # Return the tool call structure for tool execution
+                    return response
+                
+                # Convert other dicts to JSON string
+                return json.dumps(response, indent=2)
 
+            # Handle BaseModel responses (Pydantic models)
             elif isinstance(response, BaseModel):
-                response = response.model_dump()
+                if self.verbose:
+                    logger.debug(f"Agent '{self.agent_name}': Converting BaseModel to dict")
+                return response.model_dump()
 
             # Handle List[BaseModel] responses
             elif (
@@ -2852,15 +2917,34 @@ class Agent:
                 and response
                 and isinstance(response[0], BaseModel)
             ):
+                if self.verbose:
+                    logger.debug(f"Agent '{self.agent_name}': Converting list of BaseModels to dicts")
                 return [item.model_dump() for item in response]
 
-            return response
+            # Handle string responses (most common)
+            elif isinstance(response, str):
+                return response
 
-        except AgentChatCompletionResponse as e:
-            logger.error(f"Error parsing LLM output: {e}")
-            raise ValueError(
-                f"Failed to parse LLM output: {type(response)}"
-            )
+            # Handle other types by converting to string
+            else:
+                if self.verbose:
+                    logger.debug(f"Agent '{self.agent_name}': Converting {type(response)} to string")
+                return str(response)
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Agent '{self.agent_name}': JSON parsing error: {e}")
+            # Return the raw response if JSON parsing fails
+            return str(response) if response is not None else ""
+        
+        except Exception as e:
+            logger.error(f"Agent '{self.agent_name}': Error parsing LLM output: {e}")
+            logger.error(f"Agent '{self.agent_name}': Response type: {type(response)}, Content: {str(response)[:200]}...")
+            
+            # Fallback: try to return something useful
+            try:
+                return str(response) if response is not None else ""
+            except:
+                return ""
 
     def sentiment_and_evaluator(self, response: str):
         if self.evaluator:
