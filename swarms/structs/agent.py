@@ -1257,29 +1257,6 @@ class Agent:
         # to ensure proper exception propagation
         self.__handle_run_error(error)
 
-    async def _handle_run_error_async(self, error: any):
-        """
-        Async version of error handling for arun method.
-        Enhanced for streaming + tools compatibility.
-        """
-        try:
-            # Log the error with agent context
-            logger.error(f"Agent '{self.agent_name}': Async execution error: {type(error).__name__}: {str(error)}")
-            
-            # Auto-save if enabled
-            if self.autosave:
-                # Run save in thread to avoid blocking async context
-                await asyncio.to_thread(self.save)
-                await asyncio.to_thread(log_agent_data, self.to_dict())
-            
-            # Re-raise the original error
-            raise error
-            
-        except Exception as handling_error:
-            logger.error(f"Agent '{self.agent_name}': Error in async error handling: {handling_error}")
-            # Raise the original error, not the handling error
-            raise error
-
     async def arun(
         self,
         task: Optional[str] = None,
@@ -1289,12 +1266,16 @@ class Agent:
     ) -> Any:
         """
         Asynchronously runs the agent with the specified parameters.
-        
-        Enhanced to handle streaming + tools compatibility in async context.
 
         Args:
             task (Optional[str]): The task to be performed. Defaults to None.
             img (Optional[str]): The image to be processed. Defaults to None.
+            is_last (bool): Indicates if this is the last task. Defaults to False.
+            device (str): The device to use for execution. Defaults to "cpu".
+            device_id (int): The ID of the GPU to use if device is set to "gpu". Defaults to 1.
+            all_cores (bool): If True, uses all available CPU cores. Defaults to True.
+            do_not_use_cluster_ops (bool): If True, does not use cluster operations. Defaults to True.
+            all_gpus (bool): If True, uses all available GPUs. Defaults to False.
             *args: Additional positional arguments.
             **kwargs: Additional keyword arguments.
 
@@ -1305,22 +1286,6 @@ class Agent:
             Exception: If an error occurs during the asynchronous operation.
         """
         try:
-            # Log async execution start
-            if self.verbose:
-                logger.debug(f"Agent '{self.agent_name}': Starting async execution")
-            
-            # Check if tools are present for async context
-            tools_present = (
-                exists(self.tools_list_dictionary) or 
-                exists(self.mcp_url) or 
-                exists(self.mcp_urls) or 
-                exists(self.mcp_config)
-            )
-            
-            if tools_present and self.verbose:
-                logger.info(f"Agent '{self.agent_name}': Running async with tools present - streaming will be managed appropriately")
-            
-            # Use asyncio.to_thread for CPU-bound operations with proper error handling
             return await asyncio.to_thread(
                 self.run,
                 task=task,
@@ -1328,12 +1293,10 @@ class Agent:
                 *args,
                 **kwargs,
             )
-        except asyncio.CancelledError:
-            logger.warning(f"Agent '{self.agent_name}': Async execution was cancelled")
-            raise
         except Exception as error:
-            logger.error(f"Agent '{self.agent_name}': Error in async execution: {error}")
-            await self._handle_run_error_async(error)
+            await self._handle_run_error(
+                error
+            )  # Ensure this is also async if needed
 
     def __call__(
         self,
@@ -2534,16 +2497,26 @@ class Agent:
             del kwargs["is_last"]
 
         try:
-            # Check if tools are present - if so, disable streaming temporarily
-            tools_present = (
+            # Check if tools are present - if so, temporarily disable streaming for tool calls
+            # This ensures proper JSON parsing for tool execution
+            has_tools = (
                 exists(self.tools_list_dictionary) or 
                 exists(self.mcp_url) or 
-                exists(self.mcp_urls) or 
-                exists(self.mcp_config)
+                exists(self.mcp_config) or 
+                exists(self.mcp_urls)
             )
             
+            # Determine if we should use streaming for this call
+            use_streaming = self.streaming_on and not has_tools
+            
+            # Log tool detection for debugging
+            if has_tools and self.streaming_on:
+                logger.info(
+                    f"[Agent: {self.agent_name}] Tools detected, temporarily disabling streaming for proper tool parsing"
+                )
+
             # Set streaming parameter in LLM if streaming is enabled and no tools present
-            if self.streaming_on and hasattr(self.llm, "stream") and not tools_present:
+            if use_streaming and hasattr(self.llm, "stream"):
                 original_stream = self.llm.stream
                 self.llm.stream = True
 
@@ -2607,10 +2580,7 @@ class Agent:
                     self.llm.stream = original_stream
                     return streaming_response
             else:
-                # Non-streaming call or tools present (disable streaming for tools)
-                if tools_present and self.streaming_on and self.verbose:
-                    logger.info("Temporarily disabling streaming for tool execution")
-                
+                # Non-streaming call (either streaming disabled or tools present)
                 if img is not None:
                     out = self.llm.run(
                         task=task, img=img, *args, **kwargs
@@ -2622,14 +2592,9 @@ class Agent:
 
         except AgentLLMError as e:
             logger.error(
-                f"Agent '{self.agent_name}': Error calling LLM in loop {current_loop}: {e}. Task: {task[:100]}..., Args: {args}, Kwargs: {kwargs}"
+                f"Error calling LLM: {e}. Task: {task}, Args: {args}, Kwargs: {kwargs}"
             )
             raise e
-        except Exception as e:
-            logger.error(
-                f"Agent '{self.agent_name}': Unexpected error in call_llm in loop {current_loop}: {e}. Task: {task[:100]}..."
-            )
-            raise AgentLLMError(f"LLM call failed: {e}")
 
     def handle_sop_ops(self):
         # If the user inputs a list of strings for the sop then join them and set the sop
@@ -2865,8 +2830,6 @@ class Agent:
     def parse_llm_output(self, response: Any):
         """Parse and standardize the output from the LLM.
 
-        Enhanced to handle streaming + tools compatibility and ensure proper output formatting.
-
         Args:
             response (Any): The response from the LLM in any format
 
@@ -2877,39 +2840,18 @@ class Agent:
             ValueError: If the response format is unexpected and can't be handled
         """
         try:
-            # Log output parsing for debugging
-            if self.verbose:
-                logger.debug(f"Agent '{self.agent_name}': Parsing LLM output of type: {type(response)}")
 
-            # Handle None response (can happen with streaming issues)
-            if response is None:
-                logger.warning(f"Agent '{self.agent_name}': Received None response from LLM")
-                return ""
-
-            # Handle dictionary responses (including tool calls)
             if isinstance(response, dict):
-                # Standard OpenAI API response format
                 if "choices" in response:
-                    content = response["choices"][0]["message"]["content"]
-                    if self.verbose:
-                        logger.debug(f"Agent '{self.agent_name}': Extracted content from choices format")
-                    return content if content is not None else ""
-                
-                # Tool call response format
-                if "tool_calls" in response or "function" in response:
-                    if self.verbose:
-                        logger.debug(f"Agent '{self.agent_name}': Detected tool call response format")
-                    # Return the tool call structure for tool execution
-                    return response
-                
-                # Convert other dicts to JSON string
-                return json.dumps(response, indent=2)
+                    return response["choices"][0]["message"][
+                        "content"
+                    ]
+                return json.dumps(
+                    response
+                )  # Convert other dicts to string
 
-            # Handle BaseModel responses (Pydantic models)
             elif isinstance(response, BaseModel):
-                if self.verbose:
-                    logger.debug(f"Agent '{self.agent_name}': Converting BaseModel to dict")
-                return response.model_dump()
+                response = response.model_dump()
 
             # Handle List[BaseModel] responses
             elif (
@@ -2917,34 +2859,15 @@ class Agent:
                 and response
                 and isinstance(response[0], BaseModel)
             ):
-                if self.verbose:
-                    logger.debug(f"Agent '{self.agent_name}': Converting list of BaseModels to dicts")
                 return [item.model_dump() for item in response]
 
-            # Handle string responses (most common)
-            elif isinstance(response, str):
-                return response
+            return response
 
-            # Handle other types by converting to string
-            else:
-                if self.verbose:
-                    logger.debug(f"Agent '{self.agent_name}': Converting {type(response)} to string")
-                return str(response)
-
-        except json.JSONDecodeError as e:
-            logger.error(f"Agent '{self.agent_name}': JSON parsing error: {e}")
-            # Return the raw response if JSON parsing fails
-            return str(response) if response is not None else ""
-        
-        except Exception as e:
-            logger.error(f"Agent '{self.agent_name}': Error parsing LLM output: {e}")
-            logger.error(f"Agent '{self.agent_name}': Response type: {type(response)}, Content: {str(response)[:200]}...")
-            
-            # Fallback: try to return something useful
-            try:
-                return str(response) if response is not None else ""
-            except:
-                return ""
+        except AgentChatCompletionResponse as e:
+            logger.error(f"Error parsing LLM output: {e}")
+            raise ValueError(
+                f"Failed to parse LLM output: {type(response)}"
+            )
 
     def sentiment_and_evaluator(self, response: str):
         if self.evaluator:
@@ -2979,10 +2902,6 @@ class Agent:
     def mcp_tool_handling(
         self, response: any, current_loop: Optional[int] = 0
     ):
-        logger.info(f"Agent '{self.agent_name}': Starting MCP tool execution in loop {current_loop}")
-        if self.verbose:
-            logger.debug(f"Agent '{self.agent_name}': MCP response for tool parsing: {str(response)[:200]}...")
-        
         try:
 
             if exists(self.mcp_url):
@@ -3018,10 +2937,6 @@ class Agent:
             # Get the text content from the tool response
             # execute_tool_call_simple returns a string directly, not an object with content attribute
             text_content = f"MCP Tool Response: \n\n {json.dumps(tool_response, indent=2)}"
-            
-            logger.info(f"Agent '{self.agent_name}': MCP tool execution successful in loop {current_loop}")
-            if self.verbose:
-                logger.debug(f"Agent '{self.agent_name}': MCP tool output: {str(tool_response)[:200]}...")
 
             if self.print_on is True:
                 formatter.print_panel(
@@ -3058,11 +2973,8 @@ class Agent:
                 role=self.agent_name, content=summary
             )
         except AgentMCPToolError as e:
-            logger.error(f"Agent '{self.agent_name}': MCP tool execution failed in loop {current_loop}: {e}")
+            logger.error(f"Error in MCP tool: {e}")
             raise e
-        except Exception as e:
-            logger.error(f"Agent '{self.agent_name}': Unexpected error in MCP tool execution in loop {current_loop}: {e}")
-            raise AgentMCPToolError(f"MCP tool execution failed: {e}")
 
     def temp_llm_instance_for_tool_summary(self):
         return LiteLLM(
@@ -3081,38 +2993,66 @@ class Agent:
         # Handle None response gracefully
         if response is None:
             logger.warning(
-                f"Agent '{self.agent_name}': Cannot execute tools with None response in loop {loop_count}. "
+                f"Cannot execute tools with None response in loop {loop_count}. "
                 "This may indicate the LLM did not return a valid response."
             )
             return
 
-        # Log tool execution start
-        logger.info(f"Agent '{self.agent_name}': Starting tool execution in loop {loop_count}")
-        if self.verbose:
-            logger.debug(f"Agent '{self.agent_name}': Response for tool parsing: {str(response)[:200]}...")
+        # Log tool execution attempt
+        logger.info(
+            f"[Agent: {self.agent_name}] Attempting to execute tools from response in loop {loop_count}"
+        )
 
         try:
+            # Log the response being processed for tool calls
+            if self.verbose:
+                logger.debug(
+                    f"[Agent: {self.agent_name}] Processing response for tool calls: {str(response)[:200]}..."
+                )
+
             output = self.tool_struct.execute_function_calls_from_api_response(
                 response
             )
-            logger.info(f"Agent '{self.agent_name}': Tool execution successful in loop {loop_count}")
-            if self.verbose:
-                logger.debug(f"Agent '{self.agent_name}': Tool output: {str(output)[:200]}...")
+            
+            # Log successful tool execution
+            if output is not None:
+                logger.info(
+                    f"[Agent: {self.agent_name}] Tool execution successful in loop {loop_count}"
+                )
+                if self.verbose:
+                    logger.debug(
+                        f"[Agent: {self.agent_name}] Tool execution output: {str(output)[:500]}..."
+                    )
+            else:
+                logger.warning(
+                    f"[Agent: {self.agent_name}] Tool execution returned None output in loop {loop_count}"
+                )
+                
         except Exception as e:
-            logger.warning(f"Agent '{self.agent_name}': First tool execution attempt failed in loop {loop_count}: {e}. Retrying...")
+            logger.error(
+                f"[Agent: {self.agent_name}] First tool execution attempt failed in loop {loop_count}: {str(e)}"
+            )
+            
             # Retry the tool call
             try:
+                logger.info(
+                    f"[Agent: {self.agent_name}] Retrying tool execution in loop {loop_count}"
+                )
                 output = self.tool_struct.execute_function_calls_from_api_response(
                     response
                 )
-                logger.info(f"Agent '{self.agent_name}': Tool execution successful on retry in loop {loop_count}")
+                
+                if output is not None:
+                    logger.info(
+                        f"[Agent: {self.agent_name}] Tool execution successful on retry in loop {loop_count}"
+                    )
+                else:
+                    logger.error(f"[Agent: {self.agent_name}] Tool execution failed on retry: No output returned")
+                    raise AgentToolExecutionError("Tool execution failed: No output returned")
+                    
             except Exception as retry_error:
-                logger.error(f"Agent '{self.agent_name}': Tool execution failed after retry in loop {loop_count}: {retry_error}")
-                raise retry_error
-
-            if output is None:
-                logger.error(f"Agent '{self.agent_name}': Tool execution returned None output in loop {loop_count}")
-                raise Exception(f"Tool execution returned None output after retry")
+                logger.error(f"[Agent: {self.agent_name}] Tool execution retry failed: {retry_error}")
+                raise AgentToolExecutionError(f"Tool execution failed after retry: {retry_error}")
 
         self.short_memory.add(
             role="Tool Executor",
@@ -3129,6 +3069,10 @@ class Agent:
         # instead of modifying the cached one
         # Create a temporary LLM instance without tools for the follow-up call
         if self.tool_call_summary is True:
+            logger.info(
+                f"[Agent: {self.agent_name}] Generating tool execution summary in loop {loop_count}"
+            )
+            
             temp_llm = self.temp_llm_instance_for_tool_summary()
 
             tool_response = temp_llm.run(
@@ -3152,6 +3096,10 @@ class Agent:
                     tool_response,
                     loop_count,
                 )
+                
+            logger.info(
+                f"[Agent: {self.agent_name}] Tool execution summary completed in loop {loop_count}"
+            )
 
     def list_output_types(self):
         return OutputType
@@ -3313,20 +3261,40 @@ class Agent:
             - Logs detailed error information including agent name and loop count
             - Skips execution gracefully if response is None
         """
+        # Log the start of tool execution attempt
+        logger.info(
+            f"[Agent: {self.agent_name}] Starting tool execution process in loop {loop_count}"
+        )
+        
         try:
             if response is not None:
+                logger.info(
+                    f"[Agent: {self.agent_name}] Valid response received, proceeding with tool execution"
+                )
                 self.execute_tools(
                     response=response,
                     loop_count=loop_count,
                 )
+                logger.info(
+                    f"[Agent: {self.agent_name}] Tool execution completed successfully in loop {loop_count}"
+                )
             else:
                 logger.warning(
-                    f"Agent '{self.agent_name}' received None response from LLM in loop {loop_count}. "
+                    f"[Agent: {self.agent_name}] received None response from LLM in loop {loop_count}. "
                     f"This may indicate an issue with the model or prompt. Skipping tool execution."
                 )
         except AgentToolExecutionError as e:
             logger.error(
-                f"Agent '{self.agent_name}' encountered error during tool execution in loop {loop_count}: {str(e)}. "
+                f"[Agent: {self.agent_name}] encountered error during tool execution in loop {loop_count}: {str(e)}. "
                 f"Full traceback: {traceback.format_exc()}. "
-                f"Attempting to retry tool execution with 3 attempts"
+                f"Tool execution failed completely after retry attempts."
             )
+            # Re-raise the exception since this is a critical failure
+            raise e
+        except Exception as e:
+            logger.error(
+                f"[Agent: {self.agent_name}] encountered unexpected error during tool execution in loop {loop_count}: {str(e)}. "
+                f"Full traceback: {traceback.format_exc()}"
+            )
+            # Re-raise unexpected exceptions
+            raise e
